@@ -1,32 +1,52 @@
-import sublime, sublime_plugin, http.client, socket, types, threading, time, json, os, re
+import sublime, sublime_plugin, http.client, socket, types, threading, time, os, re
+import sys, decimal
+try:
+    # python 3 / Sublime Text 3
+    from . import simplejson as json
+    from .simplejson import OrderedDict
+except ValueError:
+    # python 2 / Sublime Text 2
+    import simplejson as json
+    from simplejson import OrderedDict
 
 class Options:
     def __init__(self, name):
         self.name     = name
         connections   = sublime.load_settings("ArangoExec.sublime-settings").get('connections')
         conn = connections[self.name]
-        self.host             = conn['host']
-        self.port             = conn['port']
-        self.username         = conn['username']
-        self.password         = conn['password']
-        self.database         = conn['database']
-        self.service          = conn['service'] if 'service' in conn else None
-        self.resultFileName   = conn['resultFileName'] if 'resultFileName' in conn else ''
-        self.autoSave         = conn['autoSave'] if 'autoSave' in conn else False
-        self.resultCount      = conn['resultCount'] if 'resultCount' in conn else True
-        self.batchSize        = conn['batchSize'] if 'batchSize' in conn else 1000
+        self.host                 = conn['host']
+        self.port                 = conn['port']
+        self.username             = conn['username']
+        self.password             = conn['password']
+        self.database             = conn['database']
+        # self.service              = conn['service'] if 'service' in conn else None
+        self.resultFileName       = conn['resultFileName'] if 'resultFileName' in conn else None
+        self.queryBatchSeparator  = conn['queryBatchSeparator'] if 'queryBatchSeparator' in conn else '//!'
+        self.autoSave             = conn['autoSave'] if 'autoSave' in conn else False
+        self.resultCount          = conn['resultCount'] if 'resultCount' in conn else True
+        self.batchSize            = conn['batchSize'] if 'batchSize' in conn else 1000
 
     def __str__(self):
         return self.name
 
     @staticmethod
     def list():
-        names = []
-        connections = sublime.load_settings("ArangoExec.sublime-settings").get('connections')
-        for connection in connections:
-            names.append(connection)
-        names.sort()
-        return names
+      global selectedOptionName
+      names = []
+      settings = sublime.load_settings("ArangoExec.sublime-settings")
+      default = settings.get('default');
+      connections = settings.get('connections')
+      # build names
+      for connection in connections:
+          names.append(connection)
+      # set default
+      if selectedOptionName == '':
+        if default in names:
+          selectedOptionName = default
+        else:
+          selectedOptionName = names[0]
+      # return list
+      return names
 
 class Command():
     def __init__(self):
@@ -39,26 +59,50 @@ class Command():
     HTML_CHARSET_HEADER = "CHARSET"
     htmlCharset = "utf-8"
 
-    def explain(self, query, clear):
-        bindVars = self._bindVarsFromComments(query)
-        if bindVars:
-          requestObject = { 'query' : query, 'bindVars': bindVars }
-        else:
-          requestObject = { 'query' : query }
-        urlPart = "/_api/explain"
-        respBodyText = self._execute(requestObject, urlPart)
-        self._showResult(respBodyText, clear)
+    @staticmethod
+    def json_loads(text):
+        return json.loads(text,
+                          object_pairs_hook=OrderedDict,
+                          parse_float=decimal.Decimal)
 
-    def execute(self, query, clear):
+    @staticmethod
+    def json_dumps(obj):
+        return json.dumps(obj,
+                          indent=2,
+                          ensure_ascii=False,
+                          sort_keys=False,
+                          separators=(',', ': '),
+                          use_decimal=True)
+
+    def explain(self, view, queryText, clear):
         options = self._getOptions()
-        bindVars = self._bindVarsFromComments(query)
-        if bindVars:
-          requestObject = { 'query' : query, 'bindVars': bindVars, 'count' : options.resultCount, 'batchSize': options.batchSize }
-        else:
-          requestObject = { 'query' : query, 'count' : options.resultCount, 'batchSize': options.batchSize }
-        urlPart = "/_api/cursor"
-        respBodyText = self._execute(requestObject, urlPart)
-        self._showResult(respBodyText, clear)
+        queries = self._queryBatches(queryText)
+        _clear = clear
+        for query in queries:
+          bindVars = self._bindVarsFromComments(query)
+          if bindVars:
+            requestObject = { 'query' : query, 'bindVars': bindVars }
+          else:
+            requestObject = { 'query' : query }
+          urlPart = "/_api/explain"
+          respBodyText = self._execute(requestObject, urlPart)
+          self._showResult(view, respBodyText, _clear)
+          _clear = False
+
+    def execute(self, view, queryText, clear):
+        options = self._getOptions()
+        queries = self._queryBatches(queryText)
+        _clear = clear
+        for query in queries:
+          bindVars = self._bindVarsFromComments(query)
+          if bindVars:
+            requestObject = { 'query' : query, 'bindVars': bindVars, 'count' : options.resultCount, 'batchSize': options.batchSize }
+          else:
+            requestObject = { 'query' : query, 'count' : options.resultCount, 'batchSize': options.batchSize }
+          urlPart = "/_api/cursor"
+          respBodyText = self._execute(requestObject, urlPart)
+          self._showResult(view, respBodyText, _clear)
+          _clear = False
 
     def fillDatabaseCollections(self):
         global collections
@@ -73,12 +117,22 @@ class Command():
         for collectionName in obj['result']:
             collections.append((collectionName, collectionName))
 
+    def _queryBatches(self, queryText):
+      options = self._getOptions()
+      if not options.queryBatchSeparator:
+        queries = [append(queryText)]
+      else:
+        queries = [x for x in re.split(options.queryBatchSeparator, queryText) if x.strip()]
+        # queries = [x for x in queryText.split(options.queryBatchSeparator) if x.strip()]
+      return queries
+
     def _bindVarsFromComments(self, queryText):
-      result = re.search(r'^.*bindVars\s*:\s*(\{.*\})\s*$', queryText, re.M)
+      result = re.search(r'^\s*bindVars\s*:\s*(\{.*\})\s*$', queryText, re.M)
       if result:
         try:
           return json.loads(result.group(1))
         except:
+          print('Error parsing bindVars: ' + result.group(0)) 
           return
     
     def _makeFileName(self, viewFileName, resultFileName):
@@ -87,8 +141,14 @@ class Command():
 
       directory = os.path.dirname(viewFileName)
       basename = os.path.basename(viewFileName)
+      splitbasename = os.path.splitext(basename)
+      
+      if splitbasename[1] and not splitbasename[1] == '.aql':
+        print('File ext not aql: ' + basename)
+        return None
+      
       if '*' in resultFileName:
-        return os.path.join(directory, resultFileName.replace('*', os.path.splitext(basename)[0]))
+        return os.path.join(directory, resultFileName.replace('*', splitbasename[0]))
       else:
         return os.path.join(directory, resultFileName)
     
@@ -133,35 +193,36 @@ class Command():
         panel.set_read_only(True)
         sublime.active_window().run_command("show_panel", {"panel": "output.arango_panel_output"})
 
-    def _showResult(self, respBodyText, clear):
+    def _showResult(self, view, respBodyText, clear):
         options = self._getOptions()
         
-        obj = json.loads(respBodyText)
-        prettyRespBodyText = json.dumps(obj,
-                                  indent = 2,
-                                  ensure_ascii = False,
-                                  sort_keys = True,
-                                  separators = (',', ': ')) + '\n\n'
+        #obj = json.loads(respBodyText)
+        #
+        #prettyRespBodyText = json.dumps(obj,
+        #                          indent = 2,
+        #                          ensure_ascii = False,
+        #                          #sort_keys = False,
+        #                          separators = (',', ': ')) + '\n\n'
+        
+        try:
+          obj = self.json_loads(respBodyText)
+          prettyRespBodyText = self.json_dumps(obj) + '\n\n'
+        except Exception:
+          prettyRespBodyText = respBodyText
+          #prettyRespBodyText = str(sys.exc_info()[1]) #respBodyText
+        
         if not options.resultFileName:
           self._showToConsole(prettyRespBodyText, clear)
         else:
-          active_view = sublime.active_window().active_view()
-          if not active_view:
+          if not view:
             return
-          filename = self._makeFileName(active_view.file_name(), options.resultFileName)
+          filename = self._makeFileName(view.file_name(), options.resultFileName)
           if not filename:
-            print('cannot create filename')
             return
           self._showToResultFile(filename, prettyRespBodyText, clear)
           
     def _getOptions(self):
-        global selectedIndexOptions
-
-        if selectedIndexOptions == -1 :
-            selectedIndexOptions = 0
-
-        names = Options.list()
-        options = Options(names[selectedIndexOptions])
+        options = Options(selectedOptionName)
         return options
     
     def _execute(self, requestObject, urlPart):
@@ -204,7 +265,7 @@ class Command():
             latencyTimeMilisec = int((endReqTime - startReqTime) * 1000)
             downloadTimeMilisec = int((endDownloadTime - startDownloadTime) * 1000)
 
-            #respText = self.getResponseTextForPresentation(respHeaderText, respBodyText, latencyTimeMilisec, downloadTimeMilisec)
+            print(self.getResponseTextForPresentation(respHeaderText, latencyTimeMilisec, downloadTimeMilisec))
             
             conn.close()
 
@@ -257,20 +318,28 @@ class Command():
 
         return fileType
 
-    def getResponseTextForPresentation(self, respHeaderText, respBodyText, latencyTimeMilisec, downloadTimeMilisec):
-        return respHeaderText + "\n" + "Latency: " + str(latencyTimeMilisec) + "ms" + "\n" + "Download time:" + str(downloadTimeMilisec) + "ms" + "\n\n\n" + respBodyText
+    def getResponseTextForPresentation(self, respHeaderText, latencyTimeMilisec, downloadTimeMilisec):
+        return "\nArangoExec...\n" + respHeaderText + "\n" + "Latency: " + str(latencyTimeMilisec) + "ms" + "\n" + "Download time:" + str(downloadTimeMilisec) + "ms"
 
 def arangoChangeConnection(index):
-    global selectedIndexOptions, command
-    names = Options.list()
-    selectedIndexOptions = index
-    sublime.status_message(' ArangoExec: switched to %s' % names[index])
-    command.fillDatabaseCollections()
+    global selectedOptionName, command
+    if index != -1:
+      names = Options.list()
+      selectedOptionName = names[index]
+      sublime.load_settings("ArangoExec.sublime-settings").set('default', selectedOptionName)
+      sublime.save_settings("ArangoExec.sublime-settings")
+      sublime.status_message(' ArangoExec: switched to %s' % selectedOptionName)
+      command.fillDatabaseCollections()
 
 
 class arangoListConnection(sublime_plugin.TextCommand):
     def run(self, edit):
-        sublime.active_window().show_quick_panel(Options.list(), arangoChangeConnection)
+      names = Options.list()
+      if selectedOptionName in names:
+        selected_idx = names.index(selectedOptionName)
+      else:
+        selected_idx = -1
+      sublime.active_window().show_quick_panel(names, arangoChangeConnection, selected_index=selected_idx)
 
 class ArangoExplainCommand(sublime_plugin.TextCommand):
 
@@ -286,7 +355,7 @@ class ArangoExplainCommand(sublime_plugin.TextCommand):
             else:
                 query = self.view.substr(sublime.Region(region.a, region.b))
 
-            command.explain(query, clear)
+            command.explain(self.view, query, clear)
             clear = False
 
 class ArangoExecCommand(sublime_plugin.TextCommand):
@@ -303,7 +372,7 @@ class ArangoExecCommand(sublime_plugin.TextCommand):
             else:
                 query = self.view.substr(sublime.Region(region.a, region.b))
 
-            command.execute(query, clear)
+            command.execute(self.view, query, clear)
             clear = False
 
 class ArangoExecAppendCommand(sublime_plugin.TextCommand):
@@ -319,7 +388,7 @@ class ArangoExecAppendCommand(sublime_plugin.TextCommand):
             else:
                 query = self.view.substr(sublime.Region(region.a, region.b))
 
-            command.execute(query, False)
+            command.execute(self.view, query, False)
 
 class ArangoAutoComplete(sublime_plugin.EventListener):
     def on_query_completions(self, view, prefix, locations):
@@ -330,6 +399,6 @@ class ArangoAutoComplete(sublime_plugin.EventListener):
 
         return collections
 
-selectedIndexOptions = -1
+selectedOptionName = ''
 collections = []
 command = Command()
